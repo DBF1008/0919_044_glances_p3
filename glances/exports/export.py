@@ -12,6 +12,7 @@ I am your father...
 """
 
 import re
+import time
 
 from glances.globals import NoOptionError, NoSectionError, json_dumps
 from glances.logger import logger
@@ -55,23 +56,93 @@ class GlancesExport:
         # Fields description
         self._fields_description = None
 
+        # Sampled DEBUG log state, keyed by decorated method name
+        self._log_sample_state = {}
+        self.log_every_n = self.default_log_every_n
+        self.log_every_m_seconds = self.default_log_every_m_seconds
+
         # Load the default common export configuration
         if self.config is not None:
             self.load_common_conf()
 
     def _log_result_decorator(fct):
-        """Log (DEBUG) the result of the function fct."""
+        """Log (DEBUG) the result of the function fct with sampling.
+
+        Export methods are called at a very high frequency and logging a DEBUG
+        line on every single call quickly floods the log files. The logging is
+        therefore sampled and can be tuned through the common [export] section
+        of the Glances configuration file:
+
+        - log_every_n: only log one call every N calls (0 = disabled, 1 = log
+          every call). Default: 10.
+        - log_every_m_seconds: at most one log line every M seconds for a
+          given exporter/method (0 = disabled). Default: 0 (time based
+          sampling disabled).
+
+        When both are enabled, a line is emitted as soon as one of the two
+        thresholds is reached. The sampled line also reports the number of
+        calls aggregated since the previous line and their average duration.
+        """
 
         def wrapper(*args, **kw):
+            exporter = args[0]
             counter = Counter()
             ret = fct(*args, **kw)
             duration = counter.get()
-            class_name = args[0].__class__.__name__
-            class_module = args[0].__class__.__module__
-            logger.debug(f"{class_name} {class_module} {fct.__name__} return {ret} in {duration} seconds")
+            exporter._sample_log(fct.__name__, ret, duration)
             return ret
 
         return wrapper
+
+    # Default sampling values, can be overridden in the [export] config section
+    default_log_every_n = 10
+    default_log_every_m_seconds = 0
+
+    def _sample_log(self, method_name, result, duration):
+        """Record one decorated export call and emit a sampled DEBUG line.
+
+        :param method_name: name of the decorated export method
+        :param result: value returned by the export method
+        :param duration: duration in seconds of the export method
+        """
+        every_n = getattr(self, "log_every_n", None)
+        if every_n is None:
+            every_n = self.default_log_every_n
+        every_m = getattr(self, "log_every_m_seconds", None)
+        if every_m is None:
+            every_m = self.default_log_every_m_seconds
+
+        # Sampling disabled on both axes: nothing to log
+        if every_n <= 0 and every_m <= 0:
+            return
+
+        state = self._log_sample_state.setdefault(method_name, {})
+        now = time.monotonic()
+        if not state:
+            state["count"] = 0
+            state["total_duration"] = 0.0
+            state["last_log"] = now
+
+        state["count"] += 1
+        state["total_duration"] += duration
+
+        by_count = every_n > 0 and state["count"] >= every_n
+        by_time = every_m > 0 and (now - state["last_log"]) >= every_m
+        if not (by_count or by_time):
+            return
+
+        aggregated = state["count"]
+        total_duration = state["total_duration"]
+        avg_duration = total_duration / aggregated if aggregated else duration
+        state["count"] = 0
+        state["total_duration"] = 0.0
+        state["last_log"] = now
+
+        logger.debug(
+            f"{self.__class__.__name__} {self.export_name} sampled export: "
+            f"{method_name} last return {result} in {duration} seconds "
+            f"(aggregated {aggregated} call(s), average {avg_duration:.6f} seconds)"
+        )
 
     def exit(self):
         """Close the export module."""
@@ -90,6 +161,20 @@ class GlancesExport:
             setattr(self, opt, self.config.get_list_value(section, opt))
         except NoOptionError:
             logger.debug(f"{opt} option not found in the {section} configuration section")
+
+        # Sampled export logging: log every N calls and/or every M seconds
+        for opt, default in (
+            ("log_every_n", self.default_log_every_n),
+            ("log_every_m_seconds", self.default_log_every_m_seconds),
+        ):
+            value = self.config.get_int_value(section, opt, default=default)
+            if value < 0:
+                logger.warning(
+                    f"Invalid negative value ({value}) for {opt} in the {section} "
+                    f"configuration section, fallback to {default}"
+                )
+                value = default
+            setattr(self, opt, value)
 
         logger.debug(f"Load common {section} from the Glances configuration file")
 

@@ -2,6 +2,21 @@
                                 Glances ChangeLog
 ==============================================================================
 
+=================
+Under development
+=================
+
+Enhancements:
+
+* All AsyncIO export modules (nats, ...) now share a single event loop running
+  in one daemon thread through the new EventLoopManager singleton; exporters
+  are stopped in reverse registration order during the graceful shutdown
+* Split the GlancesStats module loading into three injectable loader classes:
+  PluginLoader, AdditionalPluginLoader and ExportLoader
+* The export DEBUG logging decorator is now sampled and configurable through
+  the log_every_n and log_every_m_seconds options of the [export] section,
+  avoiding log flooding on high frequency exports
+
 =============
 Version 4.5.4
 =============
