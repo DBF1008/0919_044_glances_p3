@@ -17,83 +17,33 @@ import traceback
 from importlib import import_module
 from pathlib import Path
 
+from glances.exports.event_loop_manager import EventLoopManager
 from glances.globals import exports_path, plugins_path, sys_path, weak_lru_cache
 from glances.logger import logger
 from glances.timer import Counter
 
 
-class GlancesStats:
-    """This class stores, updates and gives stats."""
+class PluginLoader:
+    """Load the core Glances plugins from the 'plugins' folder."""
 
-    # Script header constant
-    header = "glances_"
-
-    def __init__(self, config=None, args=None):
-        # Set the config instance
+    def __init__(self, config=None):
         self.config = config
 
-        # Set the argument instance
-        self.args = args
+    def load(self, plugins, args=None):
+        """Load all plugins in the 'plugins' folder into the plugins dict."""
+        start_duration = Counter()
 
-        # Load plugins and exports modules
-        self.first_export = True
-        self.load_modules(self.args)
+        for item in os.listdir(plugins_path):
+            if os.path.isdir(os.path.join(plugins_path, item)) and not item.startswith('__') and item != 'plugin':
+                # Load the plugin
+                start_duration.reset()
+                self._load_plugin(plugins, os.path.basename(item), args=args)
+                logger.debug(f"Plugin {item} started in {start_duration.get()} seconds")
 
-    def __getattr__(self, item):
-        """Overwrite the getattr method in case of attribute is not found.
+        # Log plugins list
+        logger.debug(f"Active plugins list: {list(plugins)}")
 
-        The goal is to dynamically generate the following methods:
-        - getPlugname(): return Plugname stat in JSON format
-        - getViewsPlugname(): return views of the Plugname stat in JSON format
-        """
-        # Check if the attribute starts with 'get'
-        if item.startswith('getViews'):
-            # Get the plugin name
-            plugname = item[len('getViews') :].lower()
-            # Get the plugin instance
-            plugin = self._plugins[plugname]
-            if hasattr(plugin, 'get_json_views'):
-                # The method get_json_views exist, return it
-                return getattr(plugin, 'get_json_views')
-            # The method get_views is not found for the plugin
-            raise AttributeError(item)
-        if item.startswith('get'):
-            # Get the plugin name
-            plugname = item[len('get') :].lower()
-            # Get the plugin instance
-            plugin = self._plugins[plugname]
-            if hasattr(plugin, 'get_json'):
-                # The method get_json exist, return it
-                return getattr(plugin, 'get_json')
-            # The method get_stats is not found for the plugin
-            raise AttributeError(item)
-        # Default behavior
-        raise AttributeError(item)
-
-    def load_modules(self, args):
-        """Wrapper to load: plugins and export modules."""
-
-        # Init the plugins dict
-        # Active plugins dictionary
-        self._plugins = collections.defaultdict(dict)
-        # Load the plugins
-        self.load_plugins(args=args)
-
-        # Load addititional plugins
-        self.load_additional_plugins(args=args, config=self.config)
-
-        # Init the export modules dict
-        # Active exporters dictionary
-        self._exports = collections.defaultdict(dict)
-        # All available exporters dictionary
-        self._exports_all = collections.defaultdict(dict)
-        # Load the export modules
-        self.load_exports(args=args)
-
-        # Restoring system path
-        sys.path = sys_path
-
-    def _load_plugin(self, plugin_path, args=None, config=None):
+    def _load_plugin(self, plugins, plugin_path, args=None):
         """Load the plugin, init it and add to the _plugin dict."""
         # Load the plugin class
         try:
@@ -103,15 +53,15 @@ class GlancesStats:
             if hasattr(plugin, 'PluginModel'):
                 # Old fashion way to load the plugin (before Glances 5.0)
                 # Should be removed in Glances 5.0 - see #3170
-                self._plugins[plugin_path] = getattr(plugin, 'PluginModel')(args=args, config=config)
+                plugins[plugin_path] = getattr(plugin, 'PluginModel')(args=args, config=self.config)
                 logger.warning(
                     f'The {plugin_path} plugin class name is "PluginModel" and it is deprecated, \
 please rename it to "{plugin_path.capitalize()}Plugin"'
                 )
             elif hasattr(plugin, plugin_path.capitalize() + 'Plugin'):
                 # New fashion way to load the plugin (after Glances 5.0)
-                self._plugins[plugin_path] = getattr(plugin, plugin_path.capitalize() + 'Plugin')(
-                    args=args, config=config
+                plugins[plugin_path] = getattr(plugin, plugin_path.capitalize() + 'Plugin')(
+                    args=args, config=self.config
                 )
         except Exception as e:
             # If a plugin can not be loaded, display a critical message
@@ -131,21 +81,15 @@ please rename it to "{plugin_path.capitalize()}Plugin"'
                 else:
                     setattr(args, 'disable_' + plugin_path, getattr(args, 'disable_' + plugin_path, False))
 
-    def load_plugins(self, args=None):
-        """Load all plugins in the 'plugins' folder."""
-        start_duration = Counter()
 
-        for item in os.listdir(plugins_path):
-            if os.path.isdir(os.path.join(plugins_path, item)) and not item.startswith('__') and item != 'plugin':
-                # Load the plugin
-                start_duration.reset()
-                self._load_plugin(os.path.basename(item), args=args, config=self.config)
-                logger.debug(f"Plugin {item} started in {start_duration.get()} seconds")
+class AdditionalPluginLoader:
+    """Load additional plugins from a user-defined plugins directory."""
 
-        # Log plugins list
-        logger.debug(f"Active plugins list: {self.getPluginsList()}")
+    def __init__(self, config=None):
+        self.config = config
 
-    def _contains_plugin_model(self, plugin_file):
+    @staticmethod
+    def _contains_plugin_model(plugin_file):
         """Return True if the module defines a PluginModel class."""
         try:
             # Read and parse the Python source file into an AST
@@ -192,8 +136,9 @@ please rename it to "{plugin_path.capitalize()}Plugin"'
 
         return plugin_list
 
-    def load_additional_plugins(self, args=None, config=None):
-        """Load additional plugins if defined"""
+    def load(self, plugins, args=None):
+        """Load additional plugins into the plugins dict, if defined."""
+        config = self.config
 
         path = None
         # Skip section check as implied by has_option
@@ -217,36 +162,50 @@ please rename it to "{plugin_path.capitalize()}Plugin"'
         # Ensure plugins can be imported from the configured directory.
         sys.path.insert(0, path)
 
-        for plugin in self._get_addl_plugins(path):
-            # Prevent duplicate imports for plugins already loaded.
-            if plugin in sys.modules:
-                logger.warn(f"Plugin {plugin} already in sys.modules, skipping (workaround: rename plugin)")
-                continue
+        try:
+            for plugin in self._get_addl_plugins(path):
+                # Prevent duplicate imports for plugins already loaded.
+                if plugin in sys.modules:
+                    logger.warn(f"Plugin {plugin} already in sys.modules, skipping (workaround: rename plugin)")
+                    continue
 
-            start_duration.reset()
-            try:
-                # Dynamically import the plugin model module.
-                _mod_loaded = import_module(plugin + '.model')
+                start_duration.reset()
+                try:
+                    # Dynamically import the plugin model module.
+                    _mod_loaded = import_module(plugin + '.model')
 
-                # Create and register the plugin instance.
-                self._plugins[plugin] = _mod_loaded.PluginModel(args=args, config=config)
-                logger.debug(f"Plugin {plugin} started in {start_duration.get()} seconds")
-            except Exception as e:
-                # If a plugin can not be loaded, display a critical message
-                # on the console but do not crash
-                logger.critical(f"Error while initializing the {plugin} plugin ({e})")
-                logger.error(traceback.format_exc())
-                # An error occurred, disable the plugin
-                if args:
-                    setattr(args, 'disable_' + plugin, False)
-
-        # Restore original Python import path.
-        sys.path = _sys_path
+                    # Create and register the plugin instance.
+                    plugins[plugin] = _mod_loaded.PluginModel(args=args, config=config)
+                    logger.debug(f"Plugin {plugin} started in {start_duration.get()} seconds")
+                except Exception as e:
+                    # If a plugin can not be loaded, display a critical message
+                    # on the console but do not crash
+                    logger.critical(f"Error while initializing the {plugin} plugin ({e})")
+                    logger.error(traceback.format_exc())
+                    # An error occurred, disable the plugin
+                    if args:
+                        setattr(args, 'disable_' + plugin, False)
+        finally:
+            # Restore original Python import path.
+            sys.path = _sys_path
         # Log active additional plugins list
-        logger.debug(f"Active additional plugins list: {self.getPluginsList()}")
+        logger.debug(f"Active additional plugins list: {list(plugins)}")
 
-    def load_exports(self, args=None):
-        """Load all exporters in the 'exports' folder."""
+
+class ExportLoader:
+    """Load the export modules from the 'exports' folder."""
+
+    def __init__(self, config=None):
+        self.config = config
+
+    def load(self, exports, exports_all, args=None):
+        """Load all exporters in the 'exports' folder.
+
+        :param exports: dict filled with the active exporter instances
+        :param exports_all: dict filled with all the available exporters
+        :param args: Glances arguments
+        :return: True if exporters have been loaded, False otherwise
+        """
         start_duration = Counter()
 
         if args is None:
@@ -263,23 +222,100 @@ please rename it to "{plugin_path.capitalize()}Plugin"'
                 else:
                     exporter_name = os.path.basename(item)
                 # Set the disable_<name> to False by default
-                setattr(self.args, 'export_' + exporter_name, getattr(self.args, 'export_' + exporter_name, False))
+                setattr(args, 'export_' + exporter_name, getattr(args, 'export_' + exporter_name, False))
                 # We should import the module
-                if getattr(self.args, 'export_' + exporter_name, False):
+                if getattr(args, 'export_' + exporter_name, False):
                     # Import the export module
                     export_module = import_module(item)
                     # Add the exporter instance to the active exporters dictionary
-                    self._exports[exporter_name] = export_module.Export(args=args, config=self.config)
+                    exports[exporter_name] = export_module.Export(args=args, config=self.config)
                     # Add the exporter instance to the available exporters dictionary
-                    self._exports_all[exporter_name] = self._exports[exporter_name]
+                    exports_all[exporter_name] = exports[exporter_name]
                 else:
                     # Add the exporter name to the available exporters dictionary
-                    self._exports_all[exporter_name] = exporter_name
+                    exports_all[exporter_name] = exporter_name
                 logger.debug(f"Exporter {exporter_name} started in {start_duration.get()} seconds")
 
         # Log plugins list
-        logger.debug(f"Active exports modules list: {self.getExportsList()}")
+        logger.debug(f"Active exports modules list: {list(exports)}")
         return True
+
+
+class GlancesStats:
+    """This class stores, updates and gives stats."""
+
+    # Script header constant
+    header = "glances_"
+
+    def __init__(self, config=None, args=None, plugin_loader=None, export_loader=None, additional_plugin_loader=None):
+        # Set the config instance
+        self.config = config
+
+        # Set the argument instance
+        self.args = args
+
+        # Loaders (dependency injection, default to the standard loaders)
+        self.plugin_loader = plugin_loader or PluginLoader(config=config)
+        self.export_loader = export_loader or ExportLoader(config=config)
+        self.additional_plugin_loader = additional_plugin_loader or AdditionalPluginLoader(config=config)
+
+        # Load plugins and exports modules
+        self.first_export = True
+        self.load_modules(self.args)
+
+    def __getattr__(self, item):
+        """Overwrite the getattr method in case of attribute is not found.
+
+        The goal is to dynamically generate the following methods:
+        - getPlugname(): return Plugname stat in JSON format
+        - getViewsPlugname(): return views of the Plugname stat in JSON format
+        """
+        # Check if the attribute starts with 'get'
+        if item.startswith('getViews'):
+            # Get the plugin name
+            plugname = item[len('getViews') :].lower()
+            # Get the plugin instance
+            plugin = self._plugins[plugname]
+            if hasattr(plugin, 'get_json_views'):
+                # The method get_json_views exist, return it
+                return getattr(plugin, 'get_json_views')
+            # The method get_views is not found for the plugin
+            raise AttributeError(item)
+        if item.startswith('get'):
+            # Get the plugin name
+            plugname = item[len('get') :].lower()
+            # Get the plugin instance
+            plugin = self._plugins[plugname]
+            if hasattr(plugin, 'get_json'):
+                # The method get_json exist, return it
+                return getattr(plugin, 'get_json')
+            # The method get_stats is not found for the plugin
+            raise AttributeError(item)
+        # Default behavior
+        raise AttributeError(item)
+
+    def load_modules(self, args):
+        """Wrapper to load: plugins and export modules."""
+
+        # Init the plugins dict
+        # Active plugins dictionary
+        self._plugins = collections.defaultdict(dict)
+        # Load the plugins
+        self.plugin_loader.load(self._plugins, args=args)
+
+        # Load addititional plugins
+        self.additional_plugin_loader.load(self._plugins, args=args)
+
+        # Init the export modules dict
+        # Active exporters dictionary
+        self._exports = collections.defaultdict(dict)
+        # All available exporters dictionary
+        self._exports_all = collections.defaultdict(dict)
+        # Load the export modules
+        self.export_loader.load(self._exports, self._exports_all, args=args)
+
+        # Restoring system path
+        sys.path = sys_path
 
     def getPluginsList(self, enable=True):
         """Return the plugins list.
@@ -463,6 +499,9 @@ please rename it to "{plugin_path.capitalize()}Plugin"'
         # Close export modules
         for e in self._exports:
             self._exports[e].exit()
+        # Stop the shared event loop manager (if any AsyncIO exporter was used)
+        # Remaining registered exporters are stopped in dependency order
+        EventLoopManager.shutdown_instance()
         # Close plugins
         for p in self._plugins:
             self._plugins[p].exit()

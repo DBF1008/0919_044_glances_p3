@@ -11,7 +11,9 @@ I am your father...
 ...for all Glances exports IF.
 """
 
+import os
 import re
+import time
 
 from glances.globals import NoOptionError, NoSectionError, json_dumps
 from glances.logger import logger
@@ -30,6 +32,15 @@ class GlancesExport:
         "quicklook",
         "version",
     ]
+
+    # Sampling configuration for the _log_result_decorator.
+    # 0 (default) means "log every call" (historical behavior).
+    # Can be overridden with the GLANCES_EXPORT_LOG_SAMPLE_CALLS and
+    # GLANCES_EXPORT_LOG_SAMPLE_SECONDS environment variables or with the
+    # log_sample_calls / log_sample_seconds options of the [export] section
+    # of the Glances configuration file.
+    log_sample_calls = int(os.environ.get('GLANCES_EXPORT_LOG_SAMPLE_CALLS', 0))
+    log_sample_seconds = float(os.environ.get('GLANCES_EXPORT_LOG_SAMPLE_SECONDS', 0.0))
 
     def __init__(self, config=None, args=None):
         """Init the export class."""
@@ -60,15 +71,42 @@ class GlancesExport:
             self.load_common_conf()
 
     def _log_result_decorator(fct):
-        """Log (DEBUG) the result of the function fct."""
+        """Log (DEBUG) the result of the function fct.
+
+        To avoid log flooding in high-frequency export scenarios, logging
+        can be sampled: every N calls (log_sample_calls) and/or every
+        M seconds (log_sample_seconds). When no sampling is configured,
+        every call is logged (historical behavior).
+
+        The sampling state is stored per instance and per decorated method.
+        """
 
         def wrapper(*args, **kw):
             counter = Counter()
             ret = fct(*args, **kw)
             duration = counter.get()
-            class_name = args[0].__class__.__name__
-            class_module = args[0].__class__.__module__
-            logger.debug(f"{class_name} {class_module} {fct.__name__} return {ret} in {duration} seconds")
+            instance = args[0]
+            state = instance.__dict__.setdefault('_log_sample_state', {}).setdefault(
+                fct.__name__, {'call_count': 0, 'last_log_time': 0.0}
+            )
+            state['call_count'] += 1
+            sample_calls = getattr(instance, 'log_sample_calls', 0) or 0
+            sample_seconds = getattr(instance, 'log_sample_seconds', 0.0) or 0.0
+            if sample_calls <= 0 and sample_seconds <= 0:
+                should_log = True
+            else:
+                now = time.monotonic()
+                should_log = (sample_calls > 0 and state['call_count'] % sample_calls == 0) or (
+                    sample_seconds > 0 and now - state['last_log_time'] >= sample_seconds
+                )
+            if should_log:
+                state['last_log_time'] = time.monotonic()
+                class_name = instance.__class__.__name__
+                class_module = instance.__class__.__module__
+                logger.debug(
+                    f"{class_name} {class_module} {fct.__name__} return {ret} in {duration} seconds "
+                    f"(call #{state['call_count']})"
+                )
             return ret
 
         return wrapper
@@ -90,6 +128,12 @@ class GlancesExport:
             setattr(self, opt, self.config.get_list_value(section, opt))
         except NoOptionError:
             logger.debug(f"{opt} option not found in the {section} configuration section")
+
+        # Optional log sampling configuration (see _log_result_decorator)
+        self.log_sample_calls = self.config.get_int_value(section, 'log_sample_calls', default=self.log_sample_calls)
+        self.log_sample_seconds = self.config.get_float_value(
+            section, 'log_sample_seconds', default=self.log_sample_seconds
+        )
 
         logger.debug(f"Load common {section} from the Glances configuration file")
 

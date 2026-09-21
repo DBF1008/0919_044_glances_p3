@@ -13,9 +13,9 @@ I am your son...
 
 import asyncio
 import threading
-import time
 from abc import abstractmethod
 
+from glances.exports.event_loop_manager import EventLoopManager
 from glances.exports.export import GlancesExport
 from glances.logger import logger
 
@@ -23,8 +23,10 @@ from glances.logger import logger
 class GlancesExportAsyncio(GlancesExport):
     """Abstract class for AsyncIO-based export modules.
 
-    This class manages a persistent event loop in a background thread,
-    allowing child classes to use AsyncIO operations for exporting data.
+    This class uses a shared event loop (managed by the EventLoopManager
+    singleton) running in a background thread pool, allowing child classes
+    to use AsyncIO operations for exporting data. All AsyncIO exporters
+    share the same event loop(s) instead of spawning one thread each.
 
     Child classes must implement:
     - async _async_init(): AsyncIO initialization (e.g., connection setup)
@@ -32,29 +34,23 @@ class GlancesExportAsyncio(GlancesExport):
     - async _async_export(name, columns, points): AsyncIO export operation
     """
 
+    # Shutdown priority used when the shared EventLoopManager stops the
+    # exporters in dependency order (higher value = stopped earlier).
+    # Child classes may override this class attribute.
+    shutdown_priority = 0
+
     def __init__(self, config=None, args=None):
         """Init the AsyncIO export interface."""
         super().__init__(config=config, args=args)
 
-        # AsyncIO event loop management
-        self.loop = None
-        self._loop_ready = threading.Event()
-        self._loop_exception = None
         self._shutdown = False
+        self._exit_lock = threading.Lock()
 
-        # Start the background event loop thread
-        self._loop_thread = threading.Thread(target=self._run_event_loop, daemon=True)
-        self._loop_thread.start()
-
-        # Wait for the loop to be ready
-        if not self._loop_ready.wait(timeout=10):
-            raise RuntimeError("AsyncIO event loop failed to start within timeout")
-
-        if self._loop_exception:
-            raise RuntimeError(f"AsyncIO event loop creation failed: {self._loop_exception}")
-
-        if self.loop is None:
-            raise RuntimeError("AsyncIO event loop is None after initialization")
+        # Acquire a shared event loop from the manager (no dedicated thread
+        # per exporter) and register for ordered graceful shutdown
+        self._loop_manager = EventLoopManager.get_instance()
+        self.loop = self._loop_manager.acquire()
+        self._loop_manager.register_exporter(self, shutdown_priority=self.shutdown_priority)
 
         # Call child class AsyncIO initialization
         future = asyncio.run_coroutine_threadsafe(self._async_init(), self.loop)
@@ -63,26 +59,6 @@ class GlancesExportAsyncio(GlancesExport):
             logger.debug(f"{self.export_name} AsyncIO export initialized successfully")
         except Exception as e:
             logger.warning(f"{self.export_name} AsyncIO initialization failed: {e}. Will retry in background.")
-
-    def _run_event_loop(self):
-        """Run event loop in background thread."""
-        try:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            self._loop_ready.set()
-            self.loop.run_forever()
-        except Exception as e:
-            self._loop_exception = e
-            self._loop_ready.set()
-            logger.error(f"{self.export_name} AsyncIO event loop thread error: {e}")
-        finally:
-            # Clean up pending tasks
-            pending = asyncio.all_tasks(self.loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            self.loop.close()
 
     @abstractmethod
     async def _async_init(self):
@@ -102,7 +78,7 @@ class GlancesExportAsyncio(GlancesExport):
         Child classes should implement this method to perform AsyncIO-based
         cleanup such as disconnecting from servers, closing clients, etc.
 
-        This method is called during exit() before stopping the event loop.
+        This method is called during exit() before releasing the event loop.
         """
         pass
 
@@ -121,22 +97,26 @@ class GlancesExportAsyncio(GlancesExport):
 
     def exit(self):
         """Close the AsyncIO export module."""
+        with self._exit_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+
         super().exit()
-        self._shutdown = True
         logger.info(f"{self.export_name} AsyncIO export shutting down")
 
-        # Call child class cleanup
-        if self.loop:
+        # Call child class cleanup on the shared event loop
+        if self.loop and self.loop.is_running():
             future = asyncio.run_coroutine_threadsafe(self._async_exit(), self.loop)
             try:
                 future.result(timeout=5)
             except Exception as e:
                 logger.error(f"{self.export_name} Error in AsyncIO cleanup: {e}")
 
-        # Stop the event loop
-        if self.loop:
-            self.loop.call_soon_threadsafe(self.loop.stop)
-            time.sleep(0.5)
+        # Unregister from the graceful shutdown registry and release the
+        # shared event loop (the loop itself is stopped by the manager)
+        self._loop_manager.unregister_exporter(self)
+        self._loop_manager.release(self.loop)
 
         logger.debug(f"{self.export_name} AsyncIO export shutdown complete")
 
@@ -154,7 +134,7 @@ class GlancesExportAsyncio(GlancesExport):
             logger.error(f"{self.export_name} AsyncIO event loop is not running")
             return
 
-        # Submit the export operation to the background event loop
+        # Submit the export operation to the shared event loop
         try:
             future = asyncio.run_coroutine_threadsafe(self._async_export(name, columns, points), self.loop)
             # Don't block forever - use a short timeout

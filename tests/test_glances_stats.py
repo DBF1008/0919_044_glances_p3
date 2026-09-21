@@ -4,19 +4,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from glances.stats import GlancesStats
+from glances.stats import AdditionalPluginLoader, GlancesStats
 
 
 @pytest.fixture
-def plugin_manager():
-    """Create plugin manager instance."""
-    return GlancesStats()
+def additional_plugin_loader():
+    """Create an AdditionalPluginLoader instance."""
+    return AdditionalPluginLoader()
 
 
 class Testload_additional_plugins:  # noqa: D203
     """Tests for helper methods and main method of load_additional_plugins."""
 
-    def test_contains_plugin_model_returns_true(self, plugin_manager):
+    def test_contains_plugin_model_returns_true(self, additional_plugin_loader):
         """Should return True when PluginModel class exists."""
         with tempfile.TemporaryDirectory() as tmpdir:
             plugin_file = Path(tmpdir) / "model.py"
@@ -26,11 +26,11 @@ class Testload_additional_plugins:  # noqa: D203
                 encoding="utf-8",
             )
 
-            result = plugin_manager._contains_plugin_model(plugin_file)
+            result = additional_plugin_loader._contains_plugin_model(plugin_file)
 
             assert result is True  # nosec B101
 
-    def test_contains_plugin_model_returns_false(self, plugin_manager):
+    def test_contains_plugin_model_returns_false(self, additional_plugin_loader):
         """Should return False when PluginModel class does not exist."""
         with tempfile.TemporaryDirectory() as tmpdir:
             plugin_file = Path(tmpdir) / "model.py"
@@ -40,11 +40,11 @@ class Testload_additional_plugins:  # noqa: D203
                 encoding="utf-8",
             )
 
-            result = plugin_manager._contains_plugin_model(plugin_file)
+            result = additional_plugin_loader._contains_plugin_model(plugin_file)
 
             assert result is False  # nosec B101
 
-    def test_contains_plugin_model_handles_syntax_error(self, plugin_manager):
+    def test_contains_plugin_model_handles_syntax_error(self, additional_plugin_loader):
         """Should return False for invalid Python syntax."""
         with tempfile.TemporaryDirectory() as tmpdir:
             plugin_file = Path(tmpdir) / "model.py"
@@ -54,11 +54,11 @@ class Testload_additional_plugins:  # noqa: D203
                 encoding="utf-8",
             )
 
-            result = plugin_manager._contains_plugin_model(plugin_file)
+            result = additional_plugin_loader._contains_plugin_model(plugin_file)
 
             assert result is False  # nosec B101
 
-    def test_get_addl_plugins_returns_valid_plugins(self, plugin_manager):
+    def test_get_addl_plugins_returns_valid_plugins(self, additional_plugin_loader):
         """Should return only valid plugin directories."""
         with tempfile.TemporaryDirectory() as tmpdir:
             plugin_dir = Path(tmpdir)
@@ -79,7 +79,7 @@ class Testload_additional_plugins:  # noqa: D203
                 encoding="utf-8",
             )
 
-            result = plugin_manager._get_addl_plugins(plugin_dir)
+            result = additional_plugin_loader._get_addl_plugins(plugin_dir)
 
             assert result == ["valid_plugin"]  # nosec B101
 
@@ -89,7 +89,7 @@ class Testload_additional_plugins:  # noqa: D203
         self,
         mock_counter,
         mock_import_module,
-        plugin_manager,
+        additional_plugin_loader,
     ):
         """Should load and register additional plugins."""
         mock_args = MagicMock()
@@ -103,10 +103,39 @@ class Testload_additional_plugins:  # noqa: D203
         mock_import_module.return_value = mock_module
 
         with patch.object(
-            plugin_manager,
+            additional_plugin_loader,
             "_get_addl_plugins",
             return_value=["test_plugin"],
         ):
-            plugin_manager.load_additional_plugins(args=mock_args)
+            plugins = {}
+            additional_plugin_loader.load(plugins, args=mock_args)
 
-        assert "test_plugin" in plugin_manager._plugins  # nosec B101
+        assert "test_plugin" in plugins  # nosec B101
+
+
+class TestLoaderDependencyInjection:
+    """Tests for the loader dependency injection in GlancesStats."""
+
+    def test_default_loaders_are_created(self):
+        """GlancesStats should create default loaders when none are injected."""
+        stats = GlancesStats()
+
+        assert stats.plugin_loader is not None  # nosec B101
+        assert stats.export_loader is not None  # nosec B101
+        assert stats.additional_plugin_loader is not None  # nosec B101
+
+    def test_injected_loaders_are_used(self):
+        """GlancesStats should delegate module loading to the injected loaders."""
+        plugin_loader = MagicMock()
+        export_loader = MagicMock()
+        additional_plugin_loader = MagicMock()
+
+        stats = GlancesStats(
+            plugin_loader=plugin_loader,
+            export_loader=export_loader,
+            additional_plugin_loader=additional_plugin_loader,
+        )
+
+        plugin_loader.load.assert_called_once_with(stats._plugins, args=None)
+        additional_plugin_loader.load.assert_called_once_with(stats._plugins, args=None)
+        export_loader.load.assert_called_once_with(stats._exports, stats._exports_all, args=None)
